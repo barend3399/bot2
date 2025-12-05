@@ -3,3 +3,4 @@ lyricsgenius
 pymongo
 tabulate
 dnspython
+flask
