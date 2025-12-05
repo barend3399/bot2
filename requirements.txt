@@ -4,3 +4,4 @@ pymongo
 tabulate
 dnspython
 flask
+certifi
