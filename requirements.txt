@@ -1,0 +1,5 @@
+discord.py
+lyricsgenius
+pymongo
+tabulate
+dnspython
