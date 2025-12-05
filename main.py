@@ -6,7 +6,8 @@ from pymongo import MongoClient
 from datetime import datetime
 from tabulate import tabulate
 import asyncio
-from keep_alive import keep_alive  # Importeer de wekker
+from keep_alive import keep_alive
+import certifi  # <--- NODIG VOOR DE FIX
 
 # --- CONFIGURATIE (Haal deze uit Environment Variables in Render) ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -23,8 +24,11 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- SETUP DATABASE (MongoDB) ---
-# Zorg dat je connectiestring correct is ingevuld bij Render Env Vars
-cluster = MongoClient(MONGO_URI)
+# FIX: Gebruik certifi om de juiste SSL certificaten te vinden op Render
+ca = certifi.where()
+
+# Voeg tlsCAFile toe aan de connectie
+cluster = MongoClient(MONGO_URI, tlsCAFile=ca)
 db = cluster["discord_bot_db"]
 users_collection = db["users"]
 
@@ -44,7 +48,6 @@ def check_monthly_reset(user_data, max_credits):
     current_month = datetime.now().month
     last_reset = user_data.get("last_reset_month")
     
-    # Als de opgeslagen maand anders is dan de huidige maand
     if last_reset != current_month:
         return max_credits, current_month
     return user_data["credits"], last_reset
@@ -59,7 +62,7 @@ def process_credits(user_id, member):
     user_data = users_collection.find_one({"_id": user_id})
 
     if not user_data:
-        # Nieuwe gebruiker aanmaken in DB
+        # Nieuwe gebruiker
         user_data = {
             "_id": user_id, 
             "credits": max_credits, 
@@ -69,10 +72,9 @@ def process_credits(user_id, member):
         current_credits = max_credits
         month_check = datetime.now().month
     else:
-        # Checken of maand gereset moet worden
+        # Bestaande gebruiker: check reset
         current_credits, month_check = check_monthly_reset(user_data, max_credits)
         
-        # Update DB als maand veranderd is
         if month_check != user_data.get("last_reset_month"):
             users_collection.update_one(
                 {"_id": user_id}, 
@@ -80,7 +82,6 @@ def process_credits(user_id, member):
             )
 
     if current_credits > 0:
-        # Credits aftrekken
         users_collection.update_one({"_id": user_id}, {"$inc": {"credits": -1}})
         return True, current_credits - 1
     else:
@@ -98,33 +99,25 @@ async def search_album(ctx, *, album_name: str):
         return
     
     remaining_credits = message
-    status_msg = await ctx.send(f"🔍 Album **'{album_name}'** wordt gezocht... (Credits over: {remaining_credits})\n*Even geduld a.u.b., ik scan de nummers...*")
+    await ctx.send(f"🔍 Album **'{album_name}'** wordt gezocht... (Credits over: {remaining_credits})\n*Even geduld a.u.b., ik scan de nummers...*")
 
     try:
-        # 2. Zoek Album via Genius (in een thread zodat de bot niet vastloopt)
+        # 2. Zoek Album via Genius (in thread)
         loop = asyncio.get_event_loop()
-        
-        # We zoeken het album. 
-        # Let op: search_album kan soms het verkeerde vinden als de naam vaag is.
         album = await loop.run_in_executor(None, lambda: genius.search_album(album_name))
 
         if not album:
             await ctx.send(f"❌ Album '{album_name}' niet gevonden op Genius.")
-            # Credits teruggeven omdat het mislukte
+            # Credits teruggeven
             users_collection.update_one({"_id": ctx.author.id}, {"$inc": {"credits": 1}})
             return
 
         data_rows = []
         
-        # 3. Loop door de nummers
+        # 3. Loop door nummers
         for track in album.tracks:
-            # Soms heeft het album object al producer info, maar search_song is accurater voor details
-            # We gebruiken track info direct uit het album object om API calls te besparen waar mogelijk
-            # Maar track.song.producer_artists is vaak de veiligste weg
-            
-            # Om het sneller te maken proberen we eerst de data te pakken die we al hebben
             try:
-                # We halen song details op (dit kost tijd per nummer!)
+                # Song details ophalen
                 song = await loop.run_in_executor(None, lambda: genius.search_song(track.song.title, album.artist.name))
                 
                 if song:
@@ -136,10 +129,7 @@ async def search_album(ctx, *, album_name: str):
                     else:
                         for producer in producers:
                             prod_name = producer['name']
-                            # We gebruiken de url naar het Genius profiel als 'Instagram/Link'
-                            # Dit is veel sneller en stabieler dan web scrapen naar IG links
                             prod_link = producer.get('url', 'Geen link')
-                            
                             data_rows.append([title[:25], prod_name[:20], prod_link])
                 else:
                     data_rows.append([track.song.title[:25], "-", "-"])
@@ -148,35 +138,32 @@ async def search_album(ctx, *, album_name: str):
                 print(f"Fout bij track {track.song.title}: {e}")
                 continue
 
-        # 4. Maak de Tabel
+        # 4. Tabel maken
         headers = ["Song Name", "Producer", "Genius Link"]
         table = tabulate(data_rows, headers=headers, tablefmt="simple")
 
-        # Discord limiet check (2000 karakters)
         full_message = f"**Resultaten voor {album.name} van {album.artist.name}**\n```\n{table}\n```"
         
         if len(full_message) > 2000:
-            # Opslaan in bestandje en versturen
             filename = f"results_{album.name[:10].replace(' ', '_')}.txt"
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(table)
             
             await ctx.send(f"De lijst voor **{album.name}** is te lang voor de chat:", file=discord.File(filename))
-            os.remove(filename) # Opruimen
+            os.remove(filename)
         else:
             await ctx.send(full_message)
 
     except Exception as e:
         print(f"Grote fout: {e}")
         await ctx.send("❌ Er ging iets technisch mis. Probeer het later opnieuw.")
-        # Credits teruggeven bij error
         users_collection.update_one({"_id": ctx.author.id}, {"$inc": {"credits": 1}})
 
 @bot.event
 async def on_ready():
     print(f'Bot is online en ingelogd als {bot.user}')
 
-# --- START DE BOT ---
+# --- START ---
 if __name__ == "__main__":
-    keep_alive() # Start de webserver voor UptimeRobot
+    keep_alive()
     bot.run(DISCORD_TOKEN)
